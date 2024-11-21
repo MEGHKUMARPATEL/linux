@@ -29,7 +29,7 @@
 #include <linux/tboot.h>
 #include <linux/trace_events.h>
 #include <linux/entry-kvm.h>
-#include<linux/printk.h>
+
 #include <asm/apic.h>
 #include <asm/asm.h>
 #include <asm/cpu.h>
@@ -51,7 +51,7 @@
 #include <asm/vmx.h>
 
 #include <trace/events/ipi.h>
-
+#include <linux/printk.h>
 #include "capabilities.h"
 #include "cpuid.h"
 #include "hyperv.h"
@@ -76,9 +76,6 @@
 MODULE_AUTHOR("Qumranet");
 MODULE_DESCRIPTION("KVM support for VMX (Intel VT-x) extensions");
 MODULE_LICENSE("GPL");
-#define NUM_EXIT_TYPES 256  // Adjust if needed
-static unsigned long exit_counts[NUM_EXIT_TYPES] __attribute__((unused)) = {0};
-static unsigned long total_exits __attribute__((unused)) = 0;
 
 #ifdef MODULE
 static const struct x86_cpu_id vmx_cpu_id[] = {
@@ -6451,6 +6448,25 @@ void dump_vmcs(struct kvm_vcpu *vcpu)
  * The guest has exited.  See if we can fix it or if we need userspace
  * assistance.
  */
+static unsigned long long kvm_exit_counters[256] = {0}; 
+static unsigned long long kvm_total_exits = 0;      
+
+/* Add a helper function for human-readable exit reason names */
+static const char *kvm_exit_reason_to_string(int reason) {
+    switch (reason) {
+    case 0: return "EXCEPTION_NMI";
+    case 1: return "EXTERNAL_INTERRUPT";
+    case 2: return "TRIPLE_FAULT";
+    case 9: return "CPUID";
+    case 28: return "HLT";
+    case 30: return "MSR_WRITE";
+    case 48: return "EPT_MISCONFIG";
+    default: return "UNKNOWN_EXIT";
+    }
+}
+
+
+
 static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
@@ -6458,12 +6474,23 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 	u32 vectoring_info = vmx->idt_vectoring_info;
 	u16 exit_handler_index;
 
-	// Exit type counters
-	u64 *exit_count = kmalloc(sizeof(u64) * kvm_vmx_max_exit_handlers, GFP_KERNEL);
-	if (!exit_count)
-   		return -ENOMEM;  // handle memory allocation failure
-	memset(exit_count, 0, sizeof(u64) * kvm_vmx_max_exit_handlers);
-	static u64 total_exits = 0;
+
+
+	/* Add the counters at the start of the function */
+    int exit_type = exit_reason.basic; // Get the exit type number
+    kvm_exit_counters[exit_type]++;
+    kvm_total_exits++;
+
+    /* Print every 10,000 total exits */
+    if (kvm_total_exits % 10000 == 0) {
+        int i;
+        for (i = 0; i < 256; i++) {
+            if (kvm_exit_counters[i] > 0) {
+                printk(KERN_INFO "KVM Exit: %d (%s) occurred %llu times\n",
+                       i, kvm_exit_reason_to_string(i), kvm_exit_counters[i]);
+            }
+}
+}
 
 	/*
 	 * Flush logged GPAs PML buffer, this will make dirty_bitmap more
@@ -6585,7 +6612,7 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 		} else if (vmx->loaded_vmcs->vnmi_blocked_time > 1000000000LL &&
 			   vcpu->arch.nmi_pending) {
 			/*
-			 * This CPU doesn't support us in finding the end of an
+			 * This CPU don't support us in finding the end of an
 			 * NMI-blocked window if the guest runs with IRQs
 			 * disabled. So we pull the trigger after 1 s of
 			 * futile waiting, but inform the user about this.
@@ -6602,7 +6629,6 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 
 	if (exit_reason.basic >= kvm_vmx_max_exit_handlers)
 		goto unexpected_vmexit;
-
 #ifdef CONFIG_MITIGATION_RETPOLINE
 	if (exit_reason.basic == EXIT_REASON_MSR_WRITE)
 		return kvm_emulate_wrmsr(vcpu);
@@ -6618,24 +6644,8 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 		return handle_ept_misconfig(vcpu);
 #endif
 
-	// Update the exit count for the corresponding exit reason
-	exit_handler_index = array_index_nospec((u16)exit_reason.basic, kvm_vmx_max_exit_handlers);
-	if (exit_handler_index < kvm_vmx_max_exit_handlers)
-		exit_count[exit_handler_index]++;
-
-	// Increment the total exits count
-	total_exits++;
-
-	// Print the exit counts every 10,000 exits
-	if (total_exits % 10000 == 0) {
-		printk(KERN_INFO "VM Exit Statistics:\n");
-		for (int i = 0; i < kvm_vmx_max_exit_handlers; i++) {
-			if (exit_count[i] > 0)
-				printk(KERN_INFO "Exit type %d: %llu exits\n", i, exit_count[i]);
-		}
-	}
-	kfree(exit_count);
-
+	exit_handler_index = array_index_nospec((u16)exit_reason.basic,
+						kvm_vmx_max_exit_handlers);
 	if (!kvm_vmx_exit_handlers[exit_handler_index])
 		goto unexpected_vmexit;
 
